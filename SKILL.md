@@ -91,20 +91,20 @@ assets/whiteboard/<프로젝트명>/
 ```json
 {
   "sceneId": "scene-01",
-  "canvas": { "width": 1672, "height": 941 },
+  "canvas": { "width": 1920, "height": 1072 },
   "storyBasis": "해당 장면 자막의 사건 요약",
-  "sceneDurationMs": 9000,
+  "sceneDurationMs": 10700,
   "elements": [
     {
-      "id": "rockery",
-      "label": "석가산 장면",
+      "id": "start-line",
+      "label": "출발선",
       "sequence": 1,
-      "narrativeRole": "이야기의 장면 설정",
-      "subtitle": "원숭이 산에서 아기 원숭이 한 마리가 석가산 꼭대기에 앉아 손에 바나나를 들고 있다.",
+      "narrativeRole": "장면 설정",
+      "subtitle": "출발선에 토끼와 거북이가 나란히 섰습니다.",
       "type": "structure",
-      "region": { "x": 20, "y": 120, "width": 540, "height": 780 },
-      "reveal": { "direction": "top_to_bottom", "startMs": 300, "durationMs": 2600, "maskPaddingPx": 22, "protectedRegions": [] },
-      "handPath": { "start": [290, 130], "end": [290, 890], "easing": "easeInOut" }
+      "region": { "x": 125, "y": 408, "width": 494, "height": 323 },
+      "reveal": { "direction": "left_to_right", "startMs": 300, "durationMs": 3100, "maskPaddingPx": 22, "protectedRegions": [] },
+      "handPath": { "start": [140, 570], "end": [605, 570], "easing": "easeInOut" }
     }
   ]
 }

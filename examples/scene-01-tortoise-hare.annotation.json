@@ -1,0 +1,41 @@
+{
+  "sceneId": "scene-01",
+  "canvas": { "width": 1920, "height": 1072 },
+  "storyBasis": "출발선에 선 토끼와 거북이, 나무 그늘에서 잠든 토끼, 결승선에 닿은 거북이.",
+  "sceneDurationMs": 10700,
+  "elements": [
+    {
+      "id": "start-line",
+      "label": "출발선",
+      "sequence": 1,
+      "narrativeRole": "장면 설정",
+      "subtitle": "출발선에 토끼와 거북이가 나란히 섰습니다.",
+      "type": "structure",
+      "region": { "x": 125, "y": 408, "width": 494, "height": 323 },
+      "reveal": { "direction": "left_to_right", "startMs": 300, "durationMs": 3100, "maskPaddingPx": 22, "protectedRegions": [] },
+      "handPath": { "start": [140, 570], "end": [605, 570], "easing": "easeInOut" }
+    },
+    {
+      "id": "sleeping-hare",
+      "label": "잠든 토끼",
+      "sequence": 2,
+      "narrativeRole": "동작 전환",
+      "subtitle": "토끼는 한참 앞서 달리다 나무 그늘에서 잠이 들었어요.",
+      "type": "character",
+      "region": { "x": 839, "y": 253, "width": 311, "height": 474 },
+      "reveal": { "direction": "top_to_bottom", "startMs": 3400, "durationMs": 3400, "maskPaddingPx": 22, "protectedRegions": [] },
+      "handPath": { "start": [994, 265], "end": [994, 715], "easing": "easeInOut" }
+    },
+    {
+      "id": "finish-line",
+      "label": "결승선",
+      "sequence": 3,
+      "narrativeRole": "결과",
+      "subtitle": "그 사이 거북이는 쉬지 않고 걸어 결승선에 닿았습니다.",
+      "type": "character",
+      "region": { "x": 1312, "y": 444, "width": 475, "height": 266 },
+      "reveal": { "direction": "left_to_right", "startMs": 6800, "durationMs": 3400, "maskPaddingPx": 22, "protectedRegions": [] },
+      "handPath": { "start": [1325, 577], "end": [1775, 577], "easing": "easeInOut" }
+    }
+  ]
+}

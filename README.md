@@ -6,11 +6,11 @@ SRT 자막을 내러티브 순서에 따라 그려지는 화이트보드 손그�
 
 ## 예시
 
-**장면: 원숭이 산의 바나나 쟁탈전** —— 자막의 내러티브 순서에 따라 바위산과 아기 원숭이, 바나나를 빼앗는 큰 원숭이, 구경하는 아이들을 차례로 그립니다.
+**장면: 토끼와 거북이** — 자막의 내러티브 순서에 따라 출발선에 선 두 주인공, 나무 그늘에서 잠든 토끼, 결승선에 닿은 거북이를 차례로 그립니다.
 
-![원숭이 산의 바나나 쟁탈전: SRT 화이트보드 애니메이션 데모](examples/scene-01-monkey-mountain-stream.gif)
+![토끼와 거북이: SRT 화이트보드 애니메이션 데모](examples/scene-01-tortoise-hare.gif)
 
-원본 선화: [PNG 보기](examples/scene-01-monkey-mountain.png)
+예제 파일 한 세트가 `examples/`에 들어 있습니다. [자막 SRT](examples/tortoise-and-hare.srt) → [선화 PNG](examples/scene-01-tortoise-hare.png) → [주석 JSON](examples/scene-01-tortoise-hare.annotation.json) → [완성 MP4](examples/scene-01-tortoise-hare-whiteboard.mp4) 순서로 워크플로우 전체를 따라가 볼 수 있습니다.
 
 ## 핵심 기능
 
@@ -71,26 +71,26 @@ assets/whiteboard/<프로젝트명>/
 ```json
 {
   "sceneId": "scene-01",
-  "canvas": { "width": 1672, "height": 941 },
-  "storyBasis": "아기 원숭이가 원숭이 산에서 바나나를 들고 있고, 큰 원숭이가 바나나를 빼앗으며, 아이들이 옆에서 구경한다.",
-  "sceneDurationMs": 9000,
+  "canvas": { "width": 1920, "height": 1072 },
+  "storyBasis": "출발선에 선 토끼와 거북이, 나무 그늘에서 잠든 토끼, 결승선에 닿은 거북이.",
+  "sceneDurationMs": 10700,
   "elements": [
     {
-      "id": "rockery",
-      "label": "원숭이 산 배경",
+      "id": "start-line",
+      "label": "출발선",
       "sequence": 1,
-      "narrativeRole": "이야기의 장면 설정",
-      "subtitle": "아기 원숭이가 원숭이 산 꼭대기에 앉아 바나나를 들고 있다.",
+      "narrativeRole": "장면 설정",
+      "subtitle": "출발선에 토끼와 거북이가 나란히 섰습니다.",
       "type": "structure",
-      "region": { "x": 20, "y": 120, "width": 540, "height": 780 },
+      "region": { "x": 125, "y": 408, "width": 494, "height": 323 },
       "reveal": {
-        "direction": "top_to_bottom",
+        "direction": "left_to_right",
         "startMs": 300,
-        "durationMs": 2600,
+        "durationMs": 3100,
         "maskPaddingPx": 22,
         "protectedRegions": []
       },
-      "handPath": { "start": [290, 130], "end": [290, 890], "easing": "easeInOut" }
+      "handPath": { "start": [140, 570], "end": [605, 570], "easing": "easeInOut" }
     }
   ]
 }
