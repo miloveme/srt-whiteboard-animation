@@ -1,72 +1,199 @@
 #!/usr/bin/env python3
 """
-SRT 白板动画 - 整合渲染器（mask 编排 + stream 画法）
+SRT 화이트보드 애니메이션 - 통합 렌더러 (마스크 편성 + 스트리밍 필기)
 
-把一张线稿图 + 同名 annotation.json 渲染成白板手绘动画：
-  - 编排沿用 whiteboard-mask-animation：按 sequence/startMs 顺序逐区域揭示，
-    每个区域的可作画范围 = 矩形 region 扣除「后续区域 + protectedRegions」，
-    未开始的区域因掩码限制不会提前露线（mask 的核心不变量）。
-  - 画法换成 whiteboard-stream-animation：每个区域在自己的允许掩码内，
-    沿骨架/网格笔迹连续落墨（起笔 ink → 添彩 color），笔尖跟随真实笔迹，
-    所有区域共享同一张持久画布，已画完的区域保留在画布上。
+선화 이미지 한 장과 같은 이름의 annotation.json을 화이트보드 손그림 영상으로
+렌더링한다.
+  - 편성은 마스크 모델을 따른다: 영역을 내러티브 순서대로 하나씩 그리고,
+    각 영역은 자신의 허용 마스크(사각형 region − 이후 모든 영역 − 자신의
+    protectedRegions) 안에서만 그릴 수 있다. 따라서 아직 차례가 오지 않은
+    내용은 절대 미리 노출되지 않는다.
+  - 그리는 방식은 스트리밍 모델을 따른다: 허용 마스크 안에서 펜이 골격/그리드
+    경로를 따라 이동하며 연속으로 선을 긋고(ink 단계), 이어서 색을 입힌다
+    (color 단계). 모든 영역이 하나의 영구 캔버스를 공유하므로 이미 그린 영역은
+    화면에 그대로 남는다.
 
-与 mask 的矩形擦除揭示不同：这里是「笔尖沿线滑行、边走边落墨」的连贯笔迹。
-输出末行打印 OUTPUT=<路径>，便于上层捕获。
+모든 드로잉 기본 연산은 stream_render.CanvasOps에서 가져온다. 전체 이미지를
+그리는 렌더러도 같은 것을 쓴다. 이 모듈이 더하는 것은 영역별 편성과 장면
+타임라인뿐이다. 마지막 줄에 OUTPUT=<경로>를 출력하므로 상위 호출자가 캡처할 수 있다.
 
-用法：
-  <ENV_PY> render_stream_whiteboard.py <图片> <标注json> <输出mp4> [手部素材png]
-  可选参数见 --help（--ink-path / --color-fill / --pause / --total-ms 等）。
-  --total-ms 缺省时用标注里的 sceneDurationMs。
+사용법:
+  <ENV_PY> render_stream_whiteboard.py <이미지> <주석.json> <출력.mp4> [손이미지.png]
+  옵션은 --help 참고. --total-ms를 생략하면 주석의 sceneDurationMs를 쓴다.
 """
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
-import math
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-# 复用 stream 渲染器的全部构件（同目录）
+# 스트리밍 렌더러의 구성 요소를 그대로 재사용한다(같은 디렉터리)
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 import stream_render as sr  # noqa: E402
 
 DEFAULT_HAND = _SCRIPT_DIR.parent / "assets" / "drawing-hand.png"
 
+# 장면 끝에서 완성된 그림을 최소한 이만큼 보여준다.
+TAIL_SECONDS = 0.5
+
 
 # ──────────────────────────────────────────────────────────────
-# 区域几何：把标注画布坐标缩放到输出尺寸
+# 장면 타임라인
+#
+# 렌더러는 펜 한 자루이므로 영역은 반드시 순차적으로 그려진다.
+# 프레임을 쓰면서 암묵적인 시계를 굴리는 대신 타임라인 전체를 미리 계획하는
+# 이유는, 렌더링 길이를 sceneDurationMs와 정확히 일치시키기 위해서다.
+# 장면이 쓸 수 있는 모든 프레임은 첫 프레임을 쓰기 전에 각 단계에 배정된다.
 # ──────────────────────────────────────────────────────────────
-def _scaled_rect(region: dict, sx: float, sy: float, out_w: int, out_h: int) -> tuple[int, int, int, int]:
-    x0 = int(round(region["x"] * sx))
-    y0 = int(round(region["y"] * sy))
-    x1 = int(round((region["x"] + region["width"]) * sx))
-    y1 = int(round((region["y"] + region["height"]) * sy))
-    x0 = max(0, min(out_w, x0))
-    x1 = max(0, min(out_w, x1))
-    y0 = max(0, min(out_h, y0))
-    y1 = max(0, min(out_h, y1))
+@dataclass
+class ElementSlot:
+    """한 영역이 차지하는 타임라인 구간(단위: 프레임)."""
+
+    element: dict
+    later: list[dict] = field(repr=False)
+    begin: int
+    ink_frames: int
+    color_frames: int
+
+    @property
+    def end(self) -> int:
+        return self.begin + self.ink_frames + self.color_frames
+
+
+@dataclass
+class ScenePlan:
+    slots: list[ElementSlot]
+    total_frames: int
+    scale: float          # 장면 예산에 맞추려고 적용한 시간 축소 배율
+    honor_starts: bool    # 주석의 startMs를 그대로 쓸 수 있었는지
+
+
+def order_elements(elements: list[dict]) -> list[dict]:
+    """
+    그리는 순서. 가림(occlusion) 순서이기도 하다.
+
+    `startMs`보다 `sequence`가 우선한다. 프리뷰 스튜디오에서 모듈 순서를 바꾸면
+    `sequence`(와 배열 순서)만 다시 쓰이고 `startMs`는 그대로 남기 때문에,
+    여기서 `startMs`를 읽으면 사용자가 방금 승인한 순서를 조용히 무시하게 된다.
+    `sequence`가 없는 요소가 하나라도 있으면 배열 순서로 물러난다.
+    """
+    indexed = list(enumerate(elements))
+    if all(isinstance(e.get("sequence"), (int, float)) for e in elements):
+        indexed.sort(key=lambda pair: (pair[1]["sequence"], pair[0]))
+    return [element for _, element in indexed]
+
+
+def _starts_are_consistent(ordered: list[dict]) -> bool:
+    """그리는 순서를 따라 startMs가 단조 증가하는지, 즉 그대로 쓸 수 있는지."""
+    starts = [e["reveal"]["startMs"] for e in ordered]
+    return all(a <= b for a, b in zip(starts, starts[1:]))
+
+
+def _lay_out(ordered: list[dict], cfg: sr.Config, scale: float,
+             honor_starts: bool) -> tuple[list[ElementSlot], int]:
+    """
+    모든 영역을 프레임 축 위에 겹치지 않게 이어 붙인다.
+
+    앞 영역이 아직 그리는 중이면 요청보다 늦게 시작할 수는 있지만 더 일찍
+    시작하지는 않는다. 각 영역의 durationMs는 설정된 가중치에 따라 ink 단계와
+    color 단계로 나뉜다.
+    """
+    fps = cfg.fps
+    weight_sum = cfg.ink_weight + cfg.color_weight
+    slots: list[ElementSlot] = []
+    cursor = 0
+    for idx, element in enumerate(ordered):
+        reveal = element["reveal"]
+        duration = max(2, round(reveal["durationMs"] * scale * fps / 1000))
+        requested = round(reveal["startMs"] * fps / 1000) if honor_starts else 0
+        begin = max(requested, cursor)
+        ink_frames = max(1, round(duration * cfg.ink_weight / weight_sum))
+        color_frames = max(1, duration - ink_frames)
+        slots.append(ElementSlot(element, ordered[idx + 1:], begin, ink_frames, color_frames))
+        cursor = begin + ink_frames + color_frames
+    return slots, cursor
+
+
+def plan_scene(elements: list[dict], cfg: sr.Config, total_ms: int) -> ScenePlan:
+    """
+    주석을 명시적인 프레임 예산으로 바꾼다.
+
+    reveal 구간이 겹치는 영역들은 여기서 동시에 그려질 수 없으므로, 이어 붙이면
+    장면 길이를 넘길 수 있다. 그럴 때는 뒤를 늘리는 대신 각 영역의 길이를 줄여
+    예산에 맞춘다. sceneDurationMs는 자막 구간에서 오는 값이라, 한 장면이 길어지면
+    합치고 난 뒤 그 뒤의 모든 장면이 내레이션과 어긋나기 때문이다.
+    """
+    ordered = order_elements(elements)
+    honor_starts = _starts_are_consistent(ordered)
+    target = max(0, round(total_ms * cfg.fps / 1000))
+    tail = max(1, round(TAIL_SECONDS * cfg.fps))
+
+    slots, cursor = _lay_out(ordered, cfg, 1.0, honor_starts)
+    scale = 1.0
+    if target > 0 and cursor + tail > target:
+        low, high = 0.0, 1.0
+        for _ in range(24):  # 예산 안에 들어가는 가장 큰 배율을 찾는다
+            mid = (low + high) / 2
+            _, fitted = _lay_out(ordered, cfg, mid, honor_starts)
+            if fitted + tail <= target:
+                low = mid
+            else:
+                high = mid
+        if low > 0.0:
+            scale = low
+            slots, cursor = _lay_out(ordered, cfg, scale, honor_starts)
+
+    return ScenePlan(slots, max(target, cursor + tail), scale, honor_starts)
+
+
+# ──────────────────────────────────────────────────────────────
+# 쓴 프레임 수를 세는 기록기
+# ──────────────────────────────────────────────────────────────
+class _CountingWriter:
+    """
+    cv2.VideoWriter를 감싸 쓴 프레임 수를 센다.
+
+    모든 단계는 정해진 개수의 프레임을 내보내야 한다. 개수를 세어 두면 중간에
+    빠져나온 단계(예: 빈 마스크)를 뒤에서 채울 수 있어, 영상이 조용히 짧아지는
+    일을 막는다.
+    """
+
+    def __init__(self, writer: cv2.VideoWriter) -> None:
+        self._writer = writer
+        self.count = 0
+
+    def write(self, frame: np.ndarray) -> None:
+        self._writer.write(frame)
+        self.count += 1
+
+    def is_opened(self) -> bool:
+        return self._writer.isOpened()
+
+    def release(self) -> None:
+        self._writer.release()
+
+
+# ──────────────────────────────────────────────────────────────
+# 공유 캔버스 위에 영역 단위로 스트리밍 필기
+# ──────────────────────────────────────────────────────────────
+def _scaled_rect(region: dict, sx: float, sy: float,
+                 out_w: int, out_h: int) -> tuple[int, int, int, int]:
+    """주석 캔버스 좌표 → 출력 픽셀 좌표. 프레임 밖은 잘라낸다."""
+    x0 = max(0, min(out_w, int(round(region["x"] * sx))))
+    y0 = max(0, min(out_h, int(round(region["y"] * sy))))
+    x1 = max(0, min(out_w, int(round((region["x"] + region["width"]) * sx))))
+    y1 = max(0, min(out_h, int(round((region["y"] + region["height"]) * sy))))
     return x0, y0, x1, y1
 
 
-def _frame_progress_indices(n_steps: int, target_frames: int) -> list[int]:
-    """把 n_steps 个笔尖位置均匀映射到 target_frames 帧。"""
-    if n_steps == 0 or target_frames <= 0:
-        return []
-    if target_frames == 1:
-        return [n_steps - 1]
-    return [round(f * (n_steps - 1) / (target_frames - 1)) for f in range(target_frames)]
-
-
-# ──────────────────────────────────────────────────────────────
-# 每区域的 stream 笔迹渲染，写入共享持久画布
-# ──────────────────────────────────────────────────────────────
-class RegionStreamRenderer:
-    """持有整段渲染的共享状态；逐区域把 stream 笔迹画进同一张画布。"""
+class RegionStreamRenderer(sr.CanvasOps):
+    """장면 전체가 공유하는 상태를 들고, 영역을 하나씩 그린다."""
 
     def __init__(self, image_bgr: np.ndarray, annotation: dict, cfg: sr.Config,
                  hand_png: Path | None, bare_tip: bool) -> None:
@@ -74,21 +201,15 @@ class RegionStreamRenderer:
         self.ann = annotation
         self.canvas_bgr = sr._hex_to_bgr(cfg.canvas_hex)
 
-        # 输出尺寸：长边限到 cap，对齐到 grid_edge 的偶数倍（编码要求偶数）
         h0, w0 = image_bgr.shape[:2]
-        scale = cfg.cap_long_edge / max(h0, w0)
-        align = cfg.grid_edge if cfg.grid_edge % 2 == 0 else cfg.grid_edge * 2
-        w = max(align, (int(round(w0 * scale)) // align) * align)
-        h = max(align, (int(round(h0 * scale)) // align) * align)
-        self.out_w, self.out_h = w, h
+        self.out_w, self.out_h = sr.compute_output_size(w0, h0, cfg)
 
-        # 标注画布坐标 → 输出坐标的缩放比
-        cw = annotation["canvas"]["width"]
-        ch = annotation["canvas"]["height"]
-        self.sx = self.out_w / cw
-        self.sy = self.out_h / ch
+        # 주석 캔버스 좌표를 렌더 프레임 좌표로 옮기는 배율
+        self.sx = self.out_w / annotation["canvas"]["width"]
+        self.sy = self.out_h / annotation["canvas"]["height"]
 
-        self.color_img = cv2.resize(image_bgr, (self.out_w, self.out_h), interpolation=cv2.INTER_AREA)
+        self.color_img = cv2.resize(image_bgr, (self.out_w, self.out_h),
+                                    interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(self.color_img, cv2.COLOR_BGR2GRAY)
         self.thresh_map = cv2.adaptiveThreshold(
             gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10
@@ -98,398 +219,303 @@ class RegionStreamRenderer:
         self.ink_pixels = self.thresh_map < cfg.ink_threshold
         self.ink_paint = np.repeat(self.thresh_map[:, :, None], 3, axis=2).astype(np.float32)
 
-        # 背景染成画布底色，让上色阶段背景与起笔一致（不碰墨迹）
+        # 원본 배경을 캔버스 색으로 덮어, 채색 단계에서 종이색이 튀지 않게 한다.
         if cfg.match_bg:
             self._match_original_background()
 
-        # 共享持久画布
+        # 영구 캔버스 한 장: 이미 그린 영역은 그대로 남는다
         self.drawn = np.empty((self.out_h, self.out_w, 3), dtype=np.float32)
         self.drawn[...] = self.canvas_bgr.astype(np.float32)
 
-        # 笔尖覆盖
         self.tip: sr.TipOverlay | None = None
         if not bare_tip:
-            hand_data = sr._load_hand(hand_png, cfg.target_hand_height) if hand_png else None
-            ax, ay = cfg.tip_anchor_x, cfg.tip_anchor_y
-            if hand_data is None:
-                hand_data = sr._procedural_tip(cfg.target_hand_height)
-                ax, ay = 0.5, 0.70
-            self.tip = sr.TipOverlay(hand_data[0], hand_data[1], tip_anchor_x=ax, tip_anchor_y=ay)
+            hand = sr._load_hand(hand_png, cfg.target_hand_height) if hand_png else None
+            anchor_x, anchor_y = cfg.tip_anchor_x, cfg.tip_anchor_y
+            if hand is None:
+                hand = sr._procedural_tip(cfg.target_hand_height)
+                anchor_x, anchor_y = 0.5, 0.70
+            self.tip = sr.TipOverlay(hand[0], hand[1],
+                                     tip_anchor_x=anchor_x, tip_anchor_y=anchor_y)
 
-    # 采样原图四角，把接近背景色的像素替换为画布底色
-    def _match_original_background(self) -> None:
-        img = self.color_img
-        h, w = img.shape[:2]
-        margin = max(3, min(h, w) // 50)
-        samples = [img[:margin, :margin], img[:margin, -margin:],
-                   img[-margin:, :margin], img[-margin:, -margin:]]
-        bg = np.median(np.concatenate([s.reshape(-1, 3) for s in samples]), axis=0)
-        diff = np.abs(img.astype(np.int16) - bg.astype(np.int16)).sum(axis=2)
-        img[diff < self.cfg.match_bg_threshold] = self.canvas_bgr
-
-    def _cell_center(self, cell: tuple[int, int]) -> tuple[int, int]:
-        r, c = cell
-        e = self.cfg.grid_edge
-        return (c * e + e // 2, r * e + e // 2)
-
-    def _snapshot_with_tip(self, px: int, py: int) -> np.ndarray:
-        snap = self.drawn.astype(np.uint8)
-        if self.tip is not None:
-            self.tip.stamp(snap, px, py)
-        return snap
-
-    # ── 单区域的允许掩码：矩形 - 后续区域 - protectedRegions ──
+    # ── 허용 마스크: 사각형 − 이후 영역 − protectedRegions ──
     def _allowed_mask(self, element: dict, later_elements: list[dict]) -> np.ndarray:
         mask = np.zeros((self.out_h, self.out_w), dtype=bool)
         x0, y0, x1, y1 = _scaled_rect(element["region"], self.sx, self.sy, self.out_w, self.out_h)
         mask[y0:y1, x0:x1] = True
         for later in later_elements:
-            lx0, ly0, lx1, ly1 = _scaled_rect(later["region"], self.sx, self.sy, self.out_w, self.out_h)
+            lx0, ly0, lx1, ly1 = _scaled_rect(later["region"], self.sx, self.sy,
+                                              self.out_w, self.out_h)
             mask[ly0:ly1, lx0:lx1] = False
-        for prot in element.get("reveal", {}).get("protectedRegions", []):
-            px0, py0, px1, py1 = _scaled_rect(prot, self.sx, self.sy, self.out_w, self.out_h)
+        for protected in element.get("reveal", {}).get("protectedRegions", []):
+            px0, py0, px1, py1 = _scaled_rect(protected, self.sx, self.sy,
+                                              self.out_w, self.out_h)
             mask[py0:py1, px0:px1] = False
         return mask
 
-    # ── 区域内笔迹路径 ──
-    def _region_grid_path(self, allowed: np.ndarray) -> list[tuple[int, int]]:
-        """网格模式：把区域内含墨的格聚类并串成连续格路径。"""
-        allowed_u8 = allowed.astype(np.uint8)
-        allowed_cell = sr._to_grid_blocks(allowed_u8, self.cfg.grid_edge).any(axis=(2, 3))
+    # ── 영역 안에서의 펜 경로 ──
+    def _grid_path(self, allowed: np.ndarray) -> list[tuple[int, int]]:
+        """그리드 방식: 마스크 안의 잉크 셀을 묶어 하나의 순서 있는 경로로 만든다."""
+        allowed_cell = sr._to_grid_blocks(allowed.astype(np.uint8),
+                                          self.cfg.grid_edge).any(axis=(2, 3))
         active = self.active_all & allowed_cell
         if not active.any():
             return []
-        streams = sr.cluster_ink_streams(active)
-        return sr.flatten_streams(streams)
+        return sr.flatten_streams(sr.cluster_ink_streams(active))
 
-    def _region_skeleton_strokes(self, allowed: np.ndarray) -> list[list[tuple[int, int]]]:
-        """骨架模式：区域内墨迹细化 + 8 邻接追踪 + 重采样平滑。"""
-        cfg = self.cfg
-        region_ink = self.ink_pixels & allowed
-        if not region_ink.any():
-            return []
-        skel = sr._zhang_suen_skeleton(region_ink, max_iterations=160)
-        raw = sr.trace_8connected(skel, min_points=cfg.skeleton_min_points)
-        if not raw:
-            return []
-        spacing = cfg.skeleton_resample_spacing
-        out: list[list[tuple[int, int]]] = []
-        for stroke in raw:
-            pts = [(float(x), float(y)) for x, y in stroke]
-            pts = sr._resample_stroke_points(pts, spacing)
-            pts = sr._chaikin_smooth(pts, iterations=1)
-            pts = sr._resample_stroke_points(pts, spacing)
-            if len(pts) >= 2 and sr._stroke_cumulative_length(pts)[-1] > 2.0:
-                out.append([(int(round(x)), int(round(y))) for x, y in pts])
-        return sr._order_skeleton_strokes(out)
+    def _ink_plan(self, allowed: np.ndarray):
+        """
+        한 영역의 펜 샘플을 만든다.
 
-    # ── 落墨（限制在 allowed 内）──
-    def _reveal_ink_segment(self, a: tuple[int, int], b: tuple[int, int], allowed: np.ndarray) -> None:
-        seg = np.zeros((self.out_h, self.out_w), dtype=np.uint8)
-        thick = max(1, self.cfg.ink_reveal_radius * 2 + 1)
-        cv2.line(seg, a, b, 255, thickness=thick, lineType=cv2.LINE_AA)
-        revealed = (seg > 0) & self.ink_pixels & allowed
-        self.drawn[revealed] = self.ink_paint[revealed]
+        (samples, pen_lifts, sample_cell, path)를 돌려준다. 골격 방식에서는 샘플이
+        이미 픽셀 단위로 정확해 셀 단위 채움이 필요 없으므로 `path`가 비어 있다.
+        """
+        if self.cfg.ink_path_mode == "skeleton":
+            strokes = sr.build_skeleton_strokes(self.ink_pixels & allowed, self.cfg)
+            if strokes:
+                samples: list[tuple[int, int]] = []
+                pen_lifts: set[int] = set()
+                for index, stroke in enumerate(strokes):
+                    if index > 0:
+                        pen_lifts.add(len(samples))  # 획과 획 사이에서 펜을 든다
+                    samples.extend(stroke)
+                return samples, pen_lifts, [], []
 
-    def _ink_stamp_cell(self, cell: tuple[int, int], allowed: np.ndarray) -> None:
-        r, c = cell
-        e = self.cfg.grid_edge
-        block = self.grid_blocks[r, c]
-        allow_block = allowed[r * e:r * e + e, c * e:c * e + e]
-        ink_region = (block < self.cfg.ink_threshold) & allow_block
-        paint = np.repeat(block[:, :, None], 3, axis=2)
-        target = self.drawn[r * e:r * e + e, c * e:c * e + e]
-        target[ink_region] = paint[ink_region]
+        path = self._grid_path(allowed)
+        if not path:
+            return [], set(), [], []
+        samples, pen_lifts, sample_cell = self._build_stroke_samples(path)
+        return samples, pen_lifts, sample_cell, path
 
-    def _color_stamp(self, px: int, py: int, disk: np.ndarray, allowed: np.ndarray) -> None:
-        radius = self.cfg.brush_radius
-        h, w = self.out_h, self.out_w
-        y0, y1 = max(0, py - radius), min(h, py + radius + 1)
-        x0, x1 = max(0, px - radius), min(w, px + radius + 1)
-        if y1 <= y0 or x1 <= x0:
-            return
-        by0, by1 = y0 - (py - radius), disk.shape[0] - ((py + radius + 1) - y1)
-        bx0, bx1 = x0 - (px - radius), disk.shape[1] - ((px + radius + 1) - x1)
-        m = disk[by0:by1, bx0:bx1] * allowed[y0:y1, x0:x1]
-        inv = 1.0 - m
-        target = self.drawn[y0:y1, x0:x1]
-        source = self.color_img[y0:y1, x0:x1].astype(np.float32)
-        for ch in range(3):
-            target[:, :, ch] = target[:, :, ch] * inv + source[:, :, ch] * m
+    # ── ink 단계 ──
+    def _lay_ink(self, writer: _CountingWriter, frames: int, samples, pen_lifts,
+                 sample_cell, path, allowed: np.ndarray) -> None:
+        """
+        펜이 지나간 자리를 따라 원본 그림의 선을 드러낸다.
 
-    # ── 起笔段（骨架模式）：沿笔迹逐段揭原图墨迹，无块填充 ──
-    def _lay_ink(self, writer, frames: int, samples: list[tuple[int, int]],
-                 pen_lifts: set[int], allowed: np.ndarray) -> None:
+        그리드 방식에서는 펜이 지나가는 대로 `path`의 셀을 통째로 찍어 채워
+        면이 있는 도형이 비지 않게 하고, 골격 방식에서는 `path`가 비어 있어
+        선을 따라 드러내는 것만으로 충분하다.
+        """
         if frames <= 0:
             return
-        n = len(samples)
-        if n == 0:
-            for _ in range(frames):
-                writer.write(self._snapshot_with_tip(self.out_w // 2, self.out_h // 2))
+        if not samples:
+            self._hold(writer, frames, (self.out_w // 2, self.out_h // 2))
             return
-        idx_for_frame = _frame_progress_indices(n, frames)
-        last: int | None = None
-        for si in idx_for_frame:
-            if last is None:
-                self._reveal_ink_segment(samples[si], samples[si], allowed)
+
+        indices = sr.frame_progress_indices(len(samples), frames)
+        pauses = self._pause_frame_indices(frames, len(path) or len(samples))
+        cells_done = 0
+        previous: int | None = None
+        for frame_index, sample_index in enumerate(indices):
+            if frame_index in pauses and previous is not None:
+                writer.write(self._snapshot_with_tip(*samples[previous]))
+                continue
+
+            if previous is None:
+                self._reveal_ink_segment(samples[sample_index], samples[sample_index], allowed)
             else:
-                for k in range(last + 1, si + 1):
-                    if k in pen_lifts:
+                for step in range(previous + 1, sample_index + 1):
+                    if step in pen_lifts:
                         continue
-                    self._reveal_ink_segment(samples[k - 1], samples[k], allowed)
-            sx, sy = samples[si]
-            writer.write(self._snapshot_with_tip(sx, sy))
-            last = si
+                    self._reveal_ink_segment(samples[step - 1], samples[step], allowed)
 
-    # ── 添彩段：brush 或 contour-wipe，限制在 allowed 内 ──
-    def _wash_brush(self, writer, frames: int, centers: list[tuple[int, int]], allowed: np.ndarray) -> None:
+            if path:
+                target_cell = sample_cell[sample_index]
+                while cells_done <= target_cell and cells_done < len(path):
+                    self._ink_stamp(path[cells_done], allowed)
+                    cells_done += 1
+
+            writer.write(self._snapshot_with_tip(*samples[sample_index]))
+            previous = sample_index
+
+        while cells_done < len(path):  # 반쯤 그리다 만 셀이 남지 않게 마무리
+            self._ink_stamp(path[cells_done], allowed)
+            cells_done += 1
+
+    # ── color 단계: 경로를 따라 칠하거나, 윤곽을 인식해 쓸어내리거나 ──
+    def _wash_brush(self, writer: _CountingWriter, frames: int,
+                    centers: list[tuple[int, int]], allowed: np.ndarray) -> None:
         if frames <= 0:
             return
-        n = len(centers)
-        if n == 0:
-            for _ in range(frames):
-                writer.write(self._snapshot_with_tip(self.out_w // 2, self.out_h // 2))
+        if not centers:
+            self._hold(writer, frames, (self.out_w // 2, self.out_h // 2))
             return
-        disk = sr._feathered_disk(self.cfg.brush_radius)
-        idx_for_frame = _frame_progress_indices(n, frames)
-        last: int | None = None
-        for ci in idx_for_frame:
-            if last is None:
-                self._color_stamp(*centers[ci], disk, allowed)
-            else:
-                for k in range(last + 1, ci + 1):
-                    self._color_stamp(*centers[k], disk, allowed)
-            cx, cy = centers[ci]
-            writer.write(self._snapshot_with_tip(cx, cy))
-            last = ci
 
-    def _wash_contour(self, writer, frames: int, allowed: np.ndarray) -> None:
+        disk = sr._feathered_disk(self.cfg.brush_radius)
+        previous: int | None = None
+        for center_index in sr.frame_progress_indices(len(centers), frames):
+            start = center_index if previous is None else previous + 1
+            for step in range(start, center_index + 1):
+                self._color_stamp(*centers[step], disk, allowed)
+            writer.write(self._snapshot_with_tip(*centers[center_index]))
+            previous = center_index
+
+    def _wash_contour(self, writer: _CountingWriter, frames: int, allowed: np.ndarray) -> None:
+        """
+        색을 위에서 아래로 쓸어내리되 윤곽선에서 붙잡아 둔다.
+
+        저항장이 전진선을 뒤로 밀어내므로 색이 윤곽에서 잠시 머물다 넘어간다.
+        곧게 쓸어내리는 대신 색이 선을 따라 번지는 것처럼 보이게 하는 장치다.
+        """
         if frames <= 0:
             return
         cfg = self.cfg
         ys_all, xs_all = np.where(allowed)
         if ys_all.size == 0:
+            # 완전히 가려진 영역: 그래도 이 프레임들은 이 영역 몫이므로 화면을 유지한다
+            self._hold(writer, frames, (self.out_w // 2, self.out_h // 2))
             return
+
         top, bottom = int(ys_all.min()), int(ys_all.max())
         left, right = int(xs_all.min()), int(xs_all.max())
-        region_h = bottom - top + 1
-        region_w = right - left + 1
+        region_h, region_w = bottom - top + 1, right - left + 1
 
-        # 区域内的阻力场（墨线膨胀 + 模糊 + 逐行向下衰减）
-        ink_u8 = ((self.ink_pixels & allowed)[top:bottom + 1, left:right + 1].astype(np.uint8)) * 255
-        spread = int(np.clip(min(region_w, region_h) // 32, 3, 17))
-        if spread % 2 == 0:
-            spread = max(3, spread - 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (spread, spread))
-        dilated = cv2.dilate(ink_u8, kernel, iterations=1)
-        blur_r = max(1, int(round(min(region_w, region_h) / 220.0)))
-        if blur_r % 2 == 0:
-            blur_r += 1
-        resistance = cv2.GaussianBlur(dilated, (blur_r, blur_r), 0).astype(np.float32)
-        peak = float(resistance.max())
-        resistance = resistance / peak if peak > 1e-6 else np.zeros_like(resistance)
-        decay = cfg.wipe_decay
-        for row in range(1, region_h):
-            resistance[row] = np.maximum(resistance[row], resistance[row - 1] * decay)
+        crop = (slice(top, bottom + 1), slice(left, right + 1))
+        allowed_crop = allowed[crop]
+        color_crop = self.color_img[crop].astype(np.float32)
+        drawn_crop = self.drawn[crop]
 
+        # 띠의 폭은 잘라낸 영역이 아니라 전체 캔버스를 기준으로 잡는다. 선 굵기는
+        # 캔버스 단위의 상수이므로, 작은 영역이라고 더 거친 쓸어내림이 되면 안 된다.
+        resistance = sr.build_resistance_field(
+            (self.ink_pixels & allowed)[crop], cfg, self.out_w, self.out_h
+        )
         wave = sr._build_wipe_wave(region_w)
         delay_px = int(np.clip(region_h * cfg.wipe_delay_ratio, 12, 52))
-        ys = np.arange(region_h, dtype=np.float32)[:, None]
+        rows = np.arange(region_h, dtype=np.float32)[:, None]
         sweep = region_h + 2 * delay_px
-        blocks = max(1, cfg.wipe_blocks)
+        lanes = max(1, cfg.wipe_blocks)
 
-        allowed_crop = allowed[top:bottom + 1, left:right + 1]
-        color_crop = self.color_img[top:bottom + 1, left:right + 1].astype(np.float32)
-        drawn_crop = self.drawn[top:bottom + 1, left:right + 1]
-
-        for fi in range(frames):
-            progress = 1.0 if frames == 1 else fi / (frames - 1)
+        for frame_index in range(frames):
+            progress = 1.0 if frames == 1 else frame_index / (frames - 1)
             lead = sr._ease_in_out_sine(progress) * sweep - delay_px
-            threshold = lead + wave[None, :] - resistance * delay_px
-            reveal = (ys <= threshold) & allowed_crop
-            drawn_crop[reveal] = color_crop[reveal]
+            revealed = (rows <= lead + wave[None, :] - resistance * delay_px) & allowed_crop
+            drawn_crop[revealed] = color_crop[revealed]
 
-            lane = sr._ease_in_out_sine((fi / blocks * 2.0) % 1.0)
-            forward = (int(fi // blocks) % 2 == 0)
-            cx = int(lane * region_w) if forward else int((1.0 - lane) * region_w)
-            cx = max(0, min(region_w - 1, cx))
-            col = np.where(reveal[:, cx])[0]
-            cy = int(col[-1]) if col.size > 0 else 0
-            writer.write(self._snapshot_with_tip(left + cx, top + cy))
+            # 펜은 색이 번지는 경계 위를 좌우로 오간다. 손으로 칠하는 모습처럼.
+            lane = sr._ease_in_out_sine((frame_index / lanes * 2.0) % 1.0)
+            forward = (int(frame_index // lanes) % 2 == 0)
+            cursor_x = int(lane * region_w) if forward else int((1.0 - lane) * region_w)
+            cursor_x = max(0, min(region_w - 1, cursor_x))
+            column = np.where(revealed[:, cursor_x])[0]
+            cursor_y = int(column[-1]) if column.size > 0 else 0
+            writer.write(self._snapshot_with_tip(left + cursor_x, top + cursor_y))
 
-        # 收尾：确保区域内允许像素全部揭示
-        drawn_crop[allowed_crop] = color_crop[allowed_crop]
+        drawn_crop[allowed_crop] = color_crop[allowed_crop]  # 칠하다 만 곳을 남기지 않는다
 
-    # ── 网格路径的采样计划（插值 + 抬笔 + 块填充索引）──
-    def _grid_plan(self, path: list[tuple[int, int]]):
-        samples: list[tuple[int, int]] = []
-        pen_lifts: set[int] = set()
-        sample_cell: list[int] = []
-        for idx, cell in enumerate(path):
-            cx, cy = self._cell_center(cell)
-            if idx == 0:
-                samples.append((cx, cy))
-                sample_cell.append(idx)
-                continue
-            prev_cell = path[idx - 1]
-            prev = self._cell_center(prev_cell)
-            if math.hypot(cell[0] - prev_cell[0], cell[1] - prev_cell[1]) > math.sqrt(2):
-                pen_lifts.add(len(samples))
-                samples.append((cx, cy))
-                sample_cell.append(idx)
-                continue
-            steps = max(1, int(math.hypot(cx - prev[0], cy - prev[1]) / self.cfg.sample_step))
-            for s in range(1, steps + 1):
-                samples.append((int(prev[0] + (cx - prev[0]) * s / steps),
-                                int(prev[1] + (cy - prev[1]) * s / steps)))
-                sample_cell.append(idx)
-        return samples, pen_lifts, sample_cell
+    # ── 프레임 수 관리 ──
+    def _hold(self, writer: _CountingWriter, frames: int, at: tuple[int, int]) -> None:
+        """펜을 `at`에 세워 둔 채 현재 캔버스를 `frames`장 내보낸다."""
+        if frames <= 0:
+            return
+        snapshot = self._snapshot_with_tip(*at)
+        for _ in range(frames):
+            writer.write(snapshot)
 
-    # ── 主渲染 ──
-    def render_to(self, raw_path: Path, total_ms: int) -> Path:
-        cfg = self.cfg
-        elements = sorted(self.ann["elements"], key=lambda e: e["reveal"]["startMs"])
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(raw_path), fourcc, cfg.fps, (self.out_w, self.out_h))
-        if not writer.isOpened():
-            raise RuntimeError("无法打开视频写入器")
+    def _hold_still(self, writer: _CountingWriter, until: int) -> None:
+        """펜 없이 캔버스만으로 `until` 프레임까지 채운다."""
+        if writer.count >= until:
+            return
+        snapshot = self.drawn.astype(np.uint8)
+        while writer.count < until:
+            writer.write(snapshot)
 
-        weight_sum = cfg.ink_weight + cfg.color_weight
-        cur_ms = 0.0
-        ms_per_frame = 1000.0 / cfg.fps
+    def _run_phase(self, writer: _CountingWriter, frames: int, draw) -> None:
+        """
+        한 단계를 실행하고, 정확히 `frames`장을 쓰게 만든다.
 
-        def fill_static(until_ms: float) -> None:
-            nonlocal cur_ms
-            n = int(round((until_ms - cur_ms) / ms_per_frame))
-            if n <= 0:
-                return
-            snap = self.drawn.astype(np.uint8)
-            for _ in range(n):
-                writer.write(snap)
-            cur_ms += n * ms_per_frame
+        중간에 빠져나온 단계를 그대로 두면 타임라인과 실제 파일이 어긋나고,
+        그 뒤의 모든 영역이 그 오차를 그대로 물려받는다.
+        """
+        target = writer.count + frames
+        draw()
+        if writer.count < target:
+            self._hold(writer, target - writer.count, (self.out_w // 2, self.out_h // 2))
+
+    # ── 메인 렌더링 ──
+    def render_to(self, raw_path: Path, plan: ScenePlan) -> Path:
+        writer = _CountingWriter(cv2.VideoWriter(
+            str(raw_path), cv2.VideoWriter_fourcc(*"mp4v"),
+            self.cfg.fps, (self.out_w, self.out_h),
+        ))
+        if not writer.is_opened():
+            raise RuntimeError(f"비디오 라이터를 열 수 없습니다: {raw_path}")
 
         try:
-            for idx, element in enumerate(elements):
-                reveal = element["reveal"]
-                start_ms = reveal["startMs"]
-                dur_ms = reveal["durationMs"]
-                fill_static(start_ms)
+            for slot in plan.slots:
+                self._hold_still(writer, slot.begin)
+                allowed = self._allowed_mask(slot.element, slot.later)
+                samples, pen_lifts, sample_cell, path = self._ink_plan(allowed)
 
-                allowed = self._allowed_mask(element, elements[idx + 1:])
-                ink_frames = max(1, round(dur_ms * cfg.ink_weight / weight_sum * cfg.fps / 1000))
-                color_frames = max(1, round(dur_ms * cfg.color_weight / weight_sum * cfg.fps / 1000))
+                self._run_phase(writer, slot.ink_frames, lambda: self._lay_ink(
+                    writer, slot.ink_frames, samples, pen_lifts, sample_cell, path, allowed))
 
-                if cfg.ink_path_mode == "skeleton":
-                    strokes = self._region_skeleton_strokes(allowed)
-                    if strokes:
-                        samples, pen_lifts = [], set()
-                        for si, stroke in enumerate(strokes):
-                            if si > 0:
-                                pen_lifts.add(len(samples))
-                            samples.extend(stroke)
-                        self._lay_ink(writer, ink_frames, samples, pen_lifts, allowed)
-                        centers = samples
-                    else:
-                        path = self._region_grid_path(allowed)
-                        samples, pen_lifts, _ = self._grid_plan(path) if path else ([], set(), [])
-                        self._lay_ink(writer, ink_frames, samples, pen_lifts, allowed)
-                        centers = [self._cell_center(c) for c in path]
+                if self.cfg.color_fill == "contour-wipe":
+                    self._run_phase(writer, slot.color_frames,
+                                    lambda: self._wash_contour(writer, slot.color_frames, allowed))
                 else:
-                    path = self._region_grid_path(allowed)
-                    if path:
-                        samples, pen_lifts, sample_cell = self._grid_plan(path)
-                        # 块填充：随笔尖推进逐格铺满（保证文字/大块实心）
-                        self._lay_ink_grid(writer, ink_frames, samples, pen_lifts, sample_cell, path, allowed)
-                        centers = [self._cell_center(c) for c in path]
-                    else:
-                        self._lay_ink(writer, ink_frames, [], set(), None, allowed)
-                        centers = []
+                    centers = [self._cell_center(c) for c in path] if path else samples
+                    self._run_phase(writer, slot.color_frames,
+                                    lambda: self._wash_brush(writer, slot.color_frames,
+                                                             centers, allowed))
 
-                cur_ms += ink_frames * ms_per_frame
-
-                if cfg.color_fill == "contour-wipe":
-                    self._wash_contour(writer, color_frames, allowed)
-                else:
-                    self._wash_brush(writer, color_frames, centers, allowed)
-                cur_ms += color_frames * ms_per_frame
-
-            # 凝视：补到 total_ms，并确保结尾至少停留 0.5s 完整原图
-            gaze_until = max(total_ms, cur_ms + 500)
-            # 最终帧显示完整原图（凝视）
+            # 마무리: 완성된 그림을 그대로 보여준다
             self.drawn[...] = self.color_img.astype(np.float32)
-            fill_static(gaze_until)
+            self._hold_still(writer, plan.total_frames)
         finally:
             writer.release()
         return raw_path
 
-    # 网格起笔专用：带块填充，笔尖与揭墨同步
-    def _lay_ink_grid(self, writer, frames: int, samples, pen_lifts, sample_cell, path, allowed) -> None:
-        if frames <= 0:
-            return
-        n = len(samples)
-        if n == 0:
-            for _ in range(frames):
-                writer.write(self._snapshot_with_tip(self.out_w // 2, self.out_h // 2))
-            return
-        idx_for_frame = _frame_progress_indices(n, frames)
-        cells_done = 0
-        last: int | None = None
-        for si in idx_for_frame:
-            if last is None:
-                self._reveal_ink_segment(samples[si], samples[si], allowed)
-            else:
-                for k in range(last + 1, si + 1):
-                    if k in pen_lifts:
-                        continue
-                    self._reveal_ink_segment(samples[k - 1], samples[k], allowed)
-            target_cell = sample_cell[si]
-            while cells_done <= target_cell and cells_done < len(path):
-                self._ink_stamp_cell(path[cells_done], allowed)
-                cells_done += 1
-            sx, sy = samples[si]
-            writer.write(self._snapshot_with_tip(sx, sy))
-            last = si
-        while cells_done < len(path):
-            self._ink_stamp_cell(path[cells_done], allowed)
-            cells_done += 1
 
-
+# ──────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────
 def _parse_args(argv=None):
-    p = argparse.ArgumentParser(description="SRT 白板动画整合渲染器（mask 编排 + stream 画法）")
-    p.add_argument("image", help="线稿图路径")
-    p.add_argument("annotation", help="同名 annotation.json 路径")
-    p.add_argument("output", help="输出 MP4 路径")
-    p.add_argument("hand", nargs="?", default=str(DEFAULT_HAND), help="手部素材 PNG（默认内置）")
-    p.add_argument("--total-ms", type=int, default=None, help="总时长；缺省用标注 sceneDurationMs")
-    p.add_argument("--bare-tip", action="store_true", help="不叠加笔尖/手部")
+    p = argparse.ArgumentParser(
+        description="SRT 화이트보드 렌더러 (마스크 편성 + 스트리밍 필기)")
+    p.add_argument("image", help="선화 이미지")
+    p.add_argument("annotation", help="같은 이름의 annotation.json")
+    p.add_argument("output", help="출력 MP4 경로")
+    p.add_argument("hand", nargs="?", default=str(DEFAULT_HAND),
+                   help="손 이미지 PNG (기본값: 내장 이미지)")
+    p.add_argument("--total-ms", type=int, default=None,
+                   help="장면 길이. 생략하면 주석의 sceneDurationMs를 쓴다")
+    p.add_argument("--bare-tip", action="store_true", help="펜/손을 겹쳐 그리지 않는다")
     p.add_argument("--ink-path", default="grid", choices=["grid", "skeleton"],
-                   help="笔迹路径: grid 网格(默认); skeleton 骨架追踪")
+                   help="펜 경로: grid(기본) 또는 skeleton 골격 추적")
     p.add_argument("--color-fill", default="contour-wipe", choices=["contour-wipe", "brush"],
-                   help="上色: contour-wipe 轮廓扫描(默认); brush 沿轨迹刷")
+                   help="채색: contour-wipe(기본) 또는 경로를 따라 칠하는 brush")
     p.add_argument("--pause", default="heavy", choices=["heavy", "auto", "light", "off"],
-                   help="起笔段停顿节奏（预留，逐区域画法下影响较弱）")
+                   help="ink 단계에서 펜이 얼마나 자주 멈추는지")
     p.add_argument("--fps", type=int, default=None)
     p.add_argument("--grid-edge", type=int, default=None)
     p.add_argument("--brush-radius", type=int, default=None)
     p.add_argument("--cap-long-edge", type=int, default=None,
-                   help="输出长边像素上限（预览可调小加速，默认 1080）")
+                   help="긴 변의 픽셀 상한 (기본 1080)")
+    p.add_argument("--wipe-decay", type=float, default=None,
+                   help="윤곽이 색의 전진선을 붙잡는 정도 (기본 0.86)")
+    p.add_argument("--wipe-delay-ratio", type=float, default=None,
+                   help="윤곽에서 깎이는 영역 높이의 비율 (기본 0.04)")
+    p.add_argument("--wipe-blocks", type=int, default=None,
+                   help="contour-wipe에서 펜이 좌우로 오가는 횟수 (기본 18)")
     return p.parse_args(argv)
 
 
 def _build_cfg(args) -> sr.Config:
-    kw: dict = {}
-    if args.fps is not None:
-        kw["fps"] = args.fps
-    if args.grid_edge is not None:
-        kw["grid_edge"] = args.grid_edge
-    if args.brush_radius is not None:
-        kw["brush_radius"] = args.brush_radius
-    if args.cap_long_edge is not None:
-        kw["cap_long_edge"] = args.cap_long_edge
-    kw["ink_path_mode"] = args.ink_path
-    kw["color_fill"] = args.color_fill
-    kw["pause_mode"] = args.pause
-    return sr.Config(**kw)
+    overrides = {
+        "fps": args.fps,
+        "grid_edge": args.grid_edge,
+        "brush_radius": args.brush_radius,
+        "cap_long_edge": args.cap_long_edge,
+        "wipe_decay": args.wipe_decay,
+        "wipe_delay_ratio": args.wipe_delay_ratio,
+        "wipe_blocks": args.wipe_blocks,
+    }
+    settings = {k: v for k, v in overrides.items() if v is not None}
+    settings["ink_path_mode"] = args.ink_path
+    settings["color_fill"] = args.color_fill
+    settings["pause_mode"] = args.pause
+    return sr.Config(**settings)
 
 
 def main(argv=None) -> int:
@@ -497,43 +523,52 @@ def main(argv=None) -> int:
     cfg = _build_cfg(args)
 
     print("=" * 56)
-    print("SRT 白板动画整合渲染器 (mask 编排 + stream 画法)")
+    print("SRT 화이트보드 렌더러 (마스크 편성 + 스트리밍 필기)")
     print("=" * 56)
 
     image_bgr = sr._imread_any(args.image)
     if image_bgr is None:
-        print(f"[err] 无法读取图片: {args.image}")
+        print(f"[err] 이미지를 읽을 수 없습니다: {args.image}")
         return 1
     try:
         annotation = json.loads(Path(args.annotation).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as e:
-        print(f"[err] 无法读取标注: {e}")
+        print(f"[err] 주석을 읽을 수 없습니다: {e}")
         return 1
     if not annotation.get("elements"):
-        print("[err] 标注中没有 elements")
+        print("[err] 주석에 elements가 없습니다")
         return 1
 
-    total_ms = args.total_ms if args.total_ms is not None else annotation.get("sceneDurationMs")
+    total_ms = args.total_ms or annotation.get("sceneDurationMs")
     if not total_ms:
-        last = max(e["reveal"]["startMs"] + e["reveal"]["durationMs"] for e in annotation["elements"])
+        last = max(e["reveal"]["startMs"] + e["reveal"]["durationMs"]
+                   for e in annotation["elements"])
         total_ms = last + 1000
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path = out_path.with_name(out_path.stem + "_raw.mp4")
 
-    hand_png = Path(args.hand) if args.hand else None
-    renderer = RegionStreamRenderer(image_bgr, annotation, cfg, hand_png, args.bare_tip)
-    print(f"  输入: {args.image}")
-    print(f"  输出尺寸: {renderer.out_w}x{renderer.out_h}, 帧率: {cfg.fps}")
-    print(f"  区域数: {len(annotation['elements'])}, 总时长: {total_ms}ms, "
-          f"笔迹: {cfg.ink_path_mode}, 上色: {cfg.color_fill}")
+    renderer = RegionStreamRenderer(image_bgr, annotation, cfg,
+                                    Path(args.hand) if args.hand else None, args.bare_tip)
+    plan = plan_scene(annotation["elements"], cfg, total_ms)
 
-    renderer.render_to(raw_path, total_ms)
+    print(f"  입력: {args.image}")
+    print(f"  프레임: {renderer.out_w}x{renderer.out_h} @ {cfg.fps}fps")
+    print(f"  영역 수: {len(plan.slots)}, 길이: {plan.total_frames / cfg.fps:.2f}s "
+          f"(요청 {total_ms / 1000:.2f}s), "
+          f"필기: {cfg.ink_path_mode}, 채색: {cfg.color_fill}")
+    if not plan.honor_starts:
+        print("  [warn] startMs가 모듈 순서와 어긋나 영역을 이어 붙였습니다. "
+              "프리뷰 스튜디오에서 장면을 다시 저장하면 시간이 갱신됩니다.")
+    if plan.scale < 1.0:
+        print(f"  [warn] reveal 구간이 겹쳐 각 영역 길이를 {plan.scale:.0%}로 줄였습니다. "
+              "자막 구간과 장면 길이를 맞추기 위한 조정입니다.")
+
+    renderer.render_to(raw_path, plan)
     final = sr.transcode_h264(raw_path, out_path)
 
-    size_mb = final.stat().st_size / (1024 * 1024)
-    print(f"\n最终视频: {final}  ({size_mb:.2f} MB)")
+    print(f"\n최종 영상: {final}  ({final.stat().st_size / (1024 * 1024):.2f} MB)")
     print("=" * 56)
     print(f"OUTPUT={final}")
     return 0
