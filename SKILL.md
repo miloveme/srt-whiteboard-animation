@@ -20,6 +20,7 @@ SRT 자막을 화이트보드 손그림 애니메이션으로 변환합니다. *
 | 미완성 영역 | 영역의 허용 마스크 = 사각형 `region`에서 「후속 영역 + protectedRegions」를 제외한 부분. 시작하지 않은 영역은 완전히 숨김. |
 | 시간 산정 기준 | 각 이미지의 `sceneDurationMs`는 해당 장면 자막의 시간 범위에서 가져옴(권장 25–35초/장면). |
 | 편집 박스 | 프리뷰 스튜디오는 기본적으로 번호가 매겨진 모든 편집 박스를 표시. 편집 박스는 애니메이션 화면 콘텐츠에 포함되지 않음. |
+| 자막 | 각 영역의 `subtitle`을 그리는 동안 화면 하단에 표시(기본값). 글자 주위에 종이색 테두리를 둘러 그림 위에서도 읽히게 하며, 상자는 두지 않음. `--no-subtitles`로 끌 수 있음. |
 
 ## 통일된 이미지 생성 비주얼 규범 (필수)
 
@@ -133,9 +134,9 @@ assets/whiteboard/<프로젝트명>/
 5. **단일 장면 최종 영상 렌더링**:
    ```bash
    <ENV_PY> scripts/render_stream_whiteboard.py <이미지> <주석> <출력mp4> assets/drawing-hand.png \
-       [--ink-path grid|skeleton] [--color-fill contour-wipe|brush] [--total-ms <밀리초>]
+       [--ink-path grid|skeleton] [--color-fill contour-wipe|brush] [--total-ms <밀리초>] [--no-subtitles]
    ```
-   `--total-ms`를 생략하면 주석의 `sceneDurationMs`를 사용합니다. 마지막 줄에 `OUTPUT=<경로>`를 출력합니다.
+   `--total-ms`를 생략하면 주석의 `sceneDurationMs`를 사용합니다. 각 영역의 `subtitle`은 기본적으로 화면 하단에 함께 렌더링되므로, 자막이 정확한지 확인한 뒤 렌더링하세요. 마지막 줄에 `OUTPUT=<경로>`를 출력합니다.
 6. **다중 장면 병합**:
    ```bash
    <ENV_PY> scripts/merge_scenes.py --inputs 장면1.mp4 장면2.mp4 장면3.mp4 --output final.mp4
@@ -150,6 +151,7 @@ assets/whiteboard/<프로젝트명>/
 - `sequence`, `startMs`가 자막 사건 순서와 일치하는가. 검사 이미지의 번호/라벨/영역이 동일한 주석 JSON에서 나왔는가.
 - 오프닝, 겹치는 모듈의 중간 지점, 모든 모듈 완료 후 세 시점에서 확인: 아직 그리지 않은 모듈은 모두 보이지 않고, 겹침 보호 영역이 새어 나오지 않으며, 최종 프레임은 완전한 원본 이미지를 표시하는가.
 - 펜촉이 진행 중인 필기에 밀착해 있는가. 선화가 선명한 삽화는 `--ink-path skeleton`으로 필기를 더 잘 맞출 수 있습니다.
+- 화면 하단의 자막이 해당 영역을 그리는 동안 표시되고, 원본 SRT 문장과 글자까지 일치하는가. 줄바꿈이 어색하지 않고 그림이나 손에 가려 읽기 어렵지 않은가.
 - 모든 모듈이 끝난 뒤 완전한 원본 이미지가 최소 0.5초 유지되는가.
 - 다중 장면 병합 후 순서와 길이가 자막 스토리보드와 일치하는가.
 

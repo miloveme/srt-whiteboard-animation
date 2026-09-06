@@ -19,6 +19,7 @@ SRT 자막을 내러티브 순서에 따라 그려지는 화이트보드 손그�
 - 화면 좌표가 아닌 자막 이벤트를 기준으로 요소의 의미적 드로잉 순서 구성
 - `annotation.json`으로 영역, 타이밍, 자막 연결, 겹침 보호 영역 관리
 - 각 영역은 연속적인 스트리밍 필기 방식: 먼저 `ink`로 선화를 그리고, `color`로 채색
+- 각 영역의 자막을 화면 하단에 함께 렌더링(그림 위에서도 읽히도록 종이색 테두리)
 - 브라우저 프리뷰 스튜디오에서 영역, 순서, 타이밍, 자막 연결 조정 지원
 - 장면별 개별 렌더링과 다중 장면 병합으로 완성된 MP4 출력
 
@@ -121,6 +122,8 @@ python scripts/parse_srt.py <자막.srt> --target-sec 30 --min-sec 25 --max-sec 
   --ink-path grid --color-fill contour-wipe
 ```
 
+주석의 `subtitle`은 해당 영역을 그리는 동안 화면 하단에 표시됩니다. 자막 없이 뽑으려면 `--no-subtitles`를 붙이세요.
+
 그리는 순서는 `sequence`를 따릅니다. 프리뷰 스튜디오에서 모듈 순서를 바꾸면 `sequence`만 갱신되고 `startMs`는 그대로 남기 때문입니다. 두 값이 어긋나면 렌더러가 경고를 출력하고 영역을 순서대로 이어 붙입니다. `reveal` 구간이 서로 겹칠 때는 펜이 하나뿐이라 동시에 그릴 수 없으므로, 각 영역의 길이를 비례 축소해 장면 길이를 `sceneDurationMs`에 맞춥니다(자막 오디오와의 싱크 유지). 채색 질감은 `--wipe-decay`, `--wipe-delay-ratio`, `--wipe-blocks`로 조정할 수 있습니다.
 
 다중 장면 병합:
@@ -152,6 +155,7 @@ srt-whiteboard-animation/
 ├── scripts/
 │   ├── parse_srt.py                  # 자막 파싱 및 스토리보드 제안
 │   ├── render_annotation_preview.py  # 주석 검사 이미지
+│   ├── text_render.py                # 폰트 탐색과 자막 레이어
 │   ├── render_stream_whiteboard.py   # 스트리밍 필기 MP4 렌더러
 │   ├── merge_scenes.py               # 다중 장면 병합
 │   └── prepare_env.py                # 의존성 환경 준비

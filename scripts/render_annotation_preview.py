@@ -14,36 +14,10 @@ import json
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-# 플랫폼별 폰트 후보. CJK 글리프가 있는 폰트를 먼저 찾고, 없으면 Pillow 내장 비트맵 폰트로 물러난다
-_FONT_CANDIDATES = (
-    # macOS
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/System/Library/Fonts/PingFang.ttc",
-    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-    # Windows
-    "C:/Windows/Fonts/msyh.ttc",
-    "C:/Windows/Fonts/malgun.ttf",
-    "C:/Windows/Fonts/arial.ttf",
-    # Linux
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-)
-
-
-def _load_font(size: int) -> ImageFont.ImageFont:
-    """후보 목록에서 쓸 수 있는 폰트를 찾는다. 전부 없으면 내장 비트맵 폰트로 물러난다(예외를 던지지 않는다)."""
-    for path in _FONT_CANDIDATES:
-        if Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    try:
-        return ImageFont.load_default(size=size)  # Pillow >= 10.1
-    except TypeError:
-        return ImageFont.load_default()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from text_render import find_font  # noqa: E402
 
 
 def _text_center(draw: ImageDraw.ImageDraw, text: str, font, cx: float, cy: float) -> tuple[float, float]:
@@ -71,8 +45,8 @@ def main(image_path: str, annotation_path: str, output_path: str) -> None:
     image = Image.open(image_path).convert("RGBA")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    font = _load_font(28)
-    small_font = _load_font(18)
+    font = find_font(28)
+    small_font = find_font(18)
     colors = [(38, 103, 255, 225), (255, 105, 92, 225), (41, 167, 102, 225), (181, 100, 255, 225)]
 
     data = json.loads(Path(annotation_path).read_text(encoding="utf-8"))

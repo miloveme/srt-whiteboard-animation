@@ -36,6 +36,7 @@ import numpy as np
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 import stream_render as sr  # noqa: E402
+from text_render import render_subtitle  # noqa: E402
 
 DEFAULT_HAND = _SCRIPT_DIR.parent / "assets" / "drawing-hand.png"
 
@@ -167,8 +168,13 @@ class _CountingWriter:
     def __init__(self, writer: cv2.VideoWriter) -> None:
         self._writer = writer
         self.count = 0
+        self.overlay: tuple[np.ndarray, np.ndarray] | None = None
 
     def write(self, frame: np.ndarray) -> None:
+        if self.overlay is not None:
+            text, alpha = self.overlay
+            # 원본을 건드리지 않는다. _hold는 같은 스냅샷을 여러 번 넘긴다
+            frame = (frame * (1.0 - alpha) + text * alpha).astype(np.uint8)
         self._writer.write(frame)
         self.count += 1
 
@@ -196,9 +202,10 @@ class RegionStreamRenderer(sr.CanvasOps):
     """장면 전체가 공유하는 상태를 들고, 영역을 하나씩 그린다."""
 
     def __init__(self, image_bgr: np.ndarray, annotation: dict, cfg: sr.Config,
-                 hand_png: Path | None, bare_tip: bool) -> None:
+                 hand_png: Path | None, bare_tip: bool, subtitles: bool = True) -> None:
         self.cfg = cfg
         self.ann = annotation
+        self.subtitles = subtitles
         self.canvas_bgr = sr._hex_to_bgr(cfg.canvas_hex)
 
         h0, w0 = image_bgr.shape[:2]
@@ -420,6 +427,13 @@ class RegionStreamRenderer(sr.CanvasOps):
         while writer.count < until:
             writer.write(snapshot)
 
+    def _subtitle_overlay(self, element: dict):
+        """영역의 subtitle을 화면 하단 겹침 레이어로 만든다. 자막이 없으면 None."""
+        if not self.subtitles:
+            return None
+        return render_subtitle(element.get("subtitle", ""), self.out_w, self.out_h,
+                               tuple(int(c) for c in self.canvas_bgr))
+
     def _run_phase(self, writer: _CountingWriter, frames: int, draw) -> None:
         """
         한 단계를 실행하고, 정확히 `frames`장을 쓰게 만든다.
@@ -443,7 +457,10 @@ class RegionStreamRenderer(sr.CanvasOps):
 
         try:
             for slot in plan.slots:
+                # 자막은 해당 영역을 그리기 시작할 때 바뀐다. 그리기 전 대기 구간에는
+                # 이전 자막이 남아 있어, 문장이 끊기지 않고 다음 장면으로 이어진다.
                 self._hold_still(writer, slot.begin)
+                writer.overlay = self._subtitle_overlay(slot.element)
                 allowed = self._allowed_mask(slot.element, slot.later)
                 samples, pen_lifts, sample_cell, path = self._ink_plan(allowed)
 
@@ -481,6 +498,8 @@ def _parse_args(argv=None):
     p.add_argument("--total-ms", type=int, default=None,
                    help="장면 길이. 생략하면 주석의 sceneDurationMs를 쓴다")
     p.add_argument("--bare-tip", action="store_true", help="펜/손을 겹쳐 그리지 않는다")
+    p.add_argument("--no-subtitles", dest="subtitles", action="store_false",
+                   help="주석의 subtitle을 화면에 얹지 않는다(기본은 얹음)")
     p.add_argument("--ink-path", default="grid", choices=["grid", "skeleton"],
                    help="펜 경로: grid(기본) 또는 skeleton 골격 추적")
     p.add_argument("--color-fill", default="contour-wipe", choices=["contour-wipe", "brush"],
@@ -550,14 +569,16 @@ def main(argv=None) -> int:
     raw_path = out_path.with_name(out_path.stem + "_raw.mp4")
 
     renderer = RegionStreamRenderer(image_bgr, annotation, cfg,
-                                    Path(args.hand) if args.hand else None, args.bare_tip)
+                                    Path(args.hand) if args.hand else None, args.bare_tip,
+                                    subtitles=args.subtitles)
     plan = plan_scene(annotation["elements"], cfg, total_ms)
 
     print(f"  입력: {args.image}")
     print(f"  프레임: {renderer.out_w}x{renderer.out_h} @ {cfg.fps}fps")
     print(f"  영역 수: {len(plan.slots)}, 길이: {plan.total_frames / cfg.fps:.2f}s "
           f"(요청 {total_ms / 1000:.2f}s), "
-          f"필기: {cfg.ink_path_mode}, 채색: {cfg.color_fill}")
+          f"필기: {cfg.ink_path_mode}, 채색: {cfg.color_fill}, "
+          f"자막: {'표시' if args.subtitles else '없음'}")
     if not plan.honor_starts:
         print("  [warn] startMs가 모듈 순서와 어긋나 영역을 이어 붙였습니다. "
               "프리뷰 스튜디오에서 장면을 다시 저장하면 시간이 갱신됩니다.")
