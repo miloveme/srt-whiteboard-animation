@@ -42,7 +42,51 @@ SRT 자막을 내러티브 순서에 따라 그려지는 화이트보드 손그�
 - 미니멀한 손그림, 깨끗한 배경과 충분한 여백
 - 장면 내 텍스트, 라벨, 사진 질감, 3D 효과, 복잡한 텍스처 사용 금지
 
-## 설치 및 환경
+## 설치
+
+이 저장소 자체가 스킬 하나입니다. 루트의 `SKILL.md`가 진입점이고 `scripts/`, `assets/`가 함께 쓰이므로, 저장소 폴더를 통째로 스킬 디렉터리에 두면 됩니다.
+
+> **먼저 확인하세요.** 이 스킬은 로컬에서 Python 가상 환경을 만들고 ffmpeg로 영상을 렌더링하며, 주석 편집을 위해 브라우저로 프리뷰 스튜디오를 엽니다. 따라서 셸과 파일 시스템을 쓸 수 있는 환경(Claude Code, Codex CLI)에서 전체 워크플로우가 동작합니다. 자세한 내용은 아래 [Claude 앱](#claude-앱-claudeai--claude-desktop) 항목을 보세요.
+
+### Claude Code
+
+모든 프로젝트에서 쓰려면 개인 스킬 디렉터리에 설치합니다.
+
+```bash
+git clone https://github.com/miloveme/srt-whiteboard-animation.git \
+  ~/.claude/skills/srt-whiteboard-animation
+```
+
+특정 프로젝트에서만 쓰려면 그 저장소 안에 둡니다.
+
+```bash
+git clone https://github.com/miloveme/srt-whiteboard-animation.git \
+  .claude/skills/srt-whiteboard-animation
+```
+
+Claude Code를 다시 시작한 뒤 `/skills`로 목록에 있는지 확인하세요. SRT 파일을 주면서 "이 자막으로 화이트보드 애니메이션 만들어줘"라고 하면 자동으로 발동하고, `/srt-whiteboard-animation`으로 직접 부를 수도 있습니다.
+
+### Codex CLI · ChatGPT 데스크톱 앱
+
+```bash
+git clone https://github.com/miloveme/srt-whiteboard-animation.git \
+  ~/.agents/skills/srt-whiteboard-animation
+```
+
+프로젝트 범위로 쓰려면 저장소 안 `.agents/skills/`에 두세요. Codex CLI에서는 `/skills`로 목록을 보고 `$srt-whiteboard-animation`으로 호출하며, ChatGPT 데스크톱 앱에서는 사이드바의 Skills 패널에서 확인하고 `@`로 호출합니다. `agents/openai.yaml`에 표시 이름과 기본 프롬프트가 들어 있습니다.
+
+### Claude 앱 (claude.ai / Claude Desktop)
+
+폴더를 zip으로 압축해 설정 → Capabilities(버전에 따라 Features) → 스킬 업로드에서 올립니다. Pro·Max·Team·Enterprise 플랜에서 코드 실행이 켜져 있어야 하고, 업로드한 스킬은 계정별로 개인 사용입니다.
+
+```bash
+cd .. && zip -r srt-whiteboard-animation.zip srt-whiteboard-animation \
+  -x '*/.git/*' '*/.venv/*' '*/__pycache__/*'
+```
+
+다만 Claude 앱의 스킬은 격리된 컨테이너에서 실행되어 사용자의 파일과 브라우저에 접근할 수 없습니다. 스킬 자체는 등록되지만 프리뷰 스튜디오를 열거나 결과물을 작업 폴더에 남길 수 없으므로, 실제 제작에는 Claude Code나 Codex CLI를 쓰는 편이 좋습니다.
+
+## 실행 환경 준비
 
 Skill에는 독립적인 Python 가상 환경 준비 스크립트가 포함되어 있습니다. 처음 실행 시:
 
@@ -51,7 +95,7 @@ python scripts/prepare_env.py --check
 python scripts/prepare_env.py
 ```
 
-성공하면 첫 번째 명령이 `ENV_PY=<경로>`를 출력합니다. 이후 렌더링에는 이 인터프리터를 사용해 의존성 격리를 유지하세요.
+성공하면 첫 번째 명령이 `ENV_PY=<경로>`를 출력합니다. 이후 렌더링에는 이 인터프리터를 사용해 의존성 격리를 유지하세요. 스킬 폴더 안 `.venv/`에만 설치하므로 시스템 파이썬은 건드리지 않습니다. 병합 단계에서 시스템 `ffmpeg`가 있으면 무손실로 이어 붙이고, 없으면 함께 설치되는 PyAV로 대체합니다.
 
 ## 프로젝트 에셋 구조
 
