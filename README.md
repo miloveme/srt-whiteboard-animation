@@ -109,7 +109,7 @@ python scripts/parse_srt.py <자막.srt> --target-sec 30 --min-sec 25 --max-sec 
 영역 검사 이미지 생성:
 
 ```bash
-python scripts/render_annotation_preview.py <이미지 경로> <주석 경로> <검사 이미지 출력 경로>
+<ENV_PY> scripts/render_annotation_preview.py <이미지 경로> <주석 경로> <검사 이미지 출력 경로>
 ```
 
 `assets/preview.html`을 열고 "폴더 열기"로 장면 디렉터리를 로드하면 영역, 순서, 타이밍, 자막 연결을 편집할 수 있습니다.
@@ -121,11 +121,15 @@ python scripts/render_annotation_preview.py <이미지 경로> <주석 경로> <
   --ink-path grid --color-fill contour-wipe
 ```
 
+그리는 순서는 `sequence`를 따릅니다. 프리뷰 스튜디오에서 모듈 순서를 바꾸면 `sequence`만 갱신되고 `startMs`는 그대로 남기 때문입니다. 두 값이 어긋나면 렌더러가 경고를 출력하고 영역을 순서대로 이어 붙입니다. `reveal` 구간이 서로 겹칠 때는 펜이 하나뿐이라 동시에 그릴 수 없으므로, 각 영역의 길이를 비례 축소해 장면 길이를 `sceneDurationMs`에 맞춥니다(자막 오디오와의 싱크 유지). 채색 질감은 `--wipe-decay`, `--wipe-delay-ratio`, `--wipe-blocks`로 조정할 수 있습니다.
+
 다중 장면 병합:
 
 ```bash
 <ENV_PY> scripts/merge_scenes.py --inputs 장면1.mp4 장면2.mp4 장면3.mp4 --output final.mp4
 ```
+
+장면 크기가 모두 같으면 무손실로 이어 붙이고, 다르면 등비 축소 후 여백을 채워 병합합니다. `ffmpeg`가 없으면 PyAV로 대체 처리합니다.
 
 ## 품질 체크리스트
 

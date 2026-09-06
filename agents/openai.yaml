@@ -1,4 +1,4 @@
 interface:
-  display_name: "SRT 白板动画"
-  short_description: "把 SRT 字幕制作成可预览、可调整的流式笔迹白板动画"
-  default_prompt: "使用 $srt-whiteboard-animation 根据这份 SRT 字幕生成白板手绘动画。"
+  display_name: "SRT 화이트보드 애니메이션"
+  short_description: "SRT 자막을 미리보고 조정할 수 있는 스트리밍 필기 화이트보드 애니메이션으로 만듭니다"
+  default_prompt: "$srt-whiteboard-animation 스킬로 이 SRT 자막에서 화이트보드 손그림 애니메이션을 만들어 주세요."
